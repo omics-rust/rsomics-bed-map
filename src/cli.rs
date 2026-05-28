@@ -60,7 +60,7 @@ impl Tool for Cli {
             .operations
             .split(',')
             .map(|s| {
-                Op::from_str(s.trim())
+                Op::parse_op(s.trim())
                     .ok_or_else(|| RsomicsError::InvalidInput(format!("unknown operation: {s:?}")))
             })
             .collect::<Result<Vec<_>>>()?;

@@ -51,7 +51,7 @@ pub enum Op {
 }
 
 impl Op {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_op(s: &str) -> Option<Self> {
         match s {
             "sum" => Some(Self::Sum),
             "min" => Some(Self::Min),
@@ -203,7 +203,7 @@ fn aggregate(values: &[&str], op: Op) -> String {
             }
             nums.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let mid = nums.len() / 2;
-            let median = if nums.len() % 2 == 0 {
+            let median = if nums.len().is_multiple_of(2) {
                 (nums[mid - 1] + nums[mid]) / 2.0
             } else {
                 nums[mid]
