@@ -1,0 +1,39 @@
+[package]
+name = "rsomics-bed-map"
+version = "0.1.0"
+description = "Aggregate column values from B intervals overlapping each A interval — bedtools map equivalent"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omics-rust/rsomics-bed-map"
+authors = ["Zane Leong <efd@live.com>"]
+categories = ["science", "command-line-utilities"]
+keywords = ["bed", "map", "bedtools", "bioinformatics", "intervals"]
+
+[[bin]]
+name = "rsomics-bed-map"
+path = "src/main.rs"
+
+[lib]
+name = "rsomics_bed_map"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+rsomics-common = { version = "0.6" }
+rsomics-help = { version = "0.3" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[[bench]]
+name = "bed_map"
+harness = false
+
+[dev-dependencies.criterion]
+version = "0.7"
+default-features = false
+features = ["cargo_bench_support"]
