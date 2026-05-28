@@ -11,8 +11,12 @@
 //! Multiple columns and operations may be specified as comma-separated lists
 //! (matching bedtools map -c 4,5 -o sum,min behaviour).
 //!
-//! Algorithm: B records loaded into per-chromosome sorted Vecs; for each A
-//! record the overlap range is binary-searched for O(log N + K) queries.
+//! Algorithm: B is loaded into per-chromosome Vecs (sorted by start) storing
+//! field byte-offsets into a shared raw buffer — no per-field String allocation.
+//! For each A record the upper-bound of overlapping B records is found with a
+//! binary search; within that range only records with `end > a_start` contribute.
+//! Hit fields are collected into a reusable `Vec<Vec<u8>>` per ColOp, cleared
+//! between A records, giving O((N+M) log M) total with low allocation pressure.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -78,128 +82,228 @@ pub struct ColOp {
     pub op: Op,
 }
 
-#[derive(Debug, Clone)]
+/// A B record: integer coordinates + field boundary offsets into the shared raw buffer.
+#[derive(Debug)]
 struct BRecord {
     start: u64,
     end: u64,
-    /// All fields of the B line split by tab.
-    fields: Vec<String>,
+    /// Byte offset of this record's line start in `BChrom::buf`.
+    line_start: u32,
+    /// For each field i, `field_ends[i]` is the exclusive byte offset of that field
+    /// in `BChrom::buf`. Field 0 spans `[line_start, field_ends[0])`, etc.
+    field_ends: Vec<u32>,
 }
 
-fn is_skippable(line: &str) -> bool {
+/// Raw byte buffer + sorted record index for one chromosome.
+struct BChrom {
+    /// Concatenated lines (no newlines).
+    buf: Vec<u8>,
+    /// Records sorted by start.
+    records: Vec<BRecord>,
+    /// Maximum (end − start) across all records. Enables lower-bound binary search.
+    max_feat_size: u64,
+}
+
+impl BChrom {
+    /// Return the raw bytes of 1-based column `col` from `rec`.
+    fn field_bytes<'a>(&'a self, rec: &'a BRecord, col: usize) -> &'a [u8] {
+        let n = rec.field_ends.len();
+        if col == 0 || col > n {
+            return b"";
+        }
+        let start = if col == 1 {
+            rec.line_start as usize
+        } else {
+            rec.field_ends[col - 2] as usize + 1 // +1 to skip the tab separator
+        };
+        let end = rec.field_ends[col - 1] as usize;
+        &self.buf[start..end]
+    }
+}
+
+#[inline]
+fn is_skippable(line: &[u8]) -> bool {
     line.is_empty()
-        || line.starts_with('#')
-        || line.starts_with("track")
-        || line.starts_with("browser")
+        || line.starts_with(b"#")
+        || line.starts_with(b"track")
+        || line.starts_with(b"browser")
 }
 
-/// Load B BED file into per-chromosome Vecs sorted by start.
-fn load_b(path: &Path) -> Result<HashMap<String, Vec<BRecord>>> {
-    let raw = std::fs::read_to_string(path)
+/// Load B BED into per-chromosome structures. Uses a single byte buffer per
+/// chromosome; records store byte-offsets rather than cloned Strings.
+fn load_b(path: &Path) -> Result<HashMap<String, BChrom>> {
+    let file = File::open(path)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", path.display())))?;
-    let mut map: HashMap<String, Vec<BRecord>> = HashMap::new();
-    for line in raw.lines() {
-        if is_skippable(line) {
+    let reader = BufReader::with_capacity(256 * 1024, file);
+
+    let mut chrom_data: HashMap<String, (Vec<u8>, Vec<BRecord>, u64)> = HashMap::new();
+
+    for line_result in reader.split(b'\n') {
+        let line = line_result.map_err(RsomicsError::Io)?;
+        if is_skippable(&line) {
             continue;
         }
-        let fields: Vec<String> = line.split('\t').map(str::to_owned).collect();
-        if fields.len() < 3 {
-            continue;
+
+        // Locate first three tab positions to extract chrom, start, end cheaply.
+        let mut tab_pos = [0usize; 3];
+        let mut ntabs = 0usize;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b'\t' {
+                if ntabs < 3 {
+                    tab_pos[ntabs] = i;
+                }
+                ntabs += 1;
+            }
         }
-        let chrom = fields[0].clone();
-        let start: u64 = fields[1].parse().unwrap_or(0);
-        let end: u64 = fields[2].parse().unwrap_or(0);
-        map.entry(chrom)
-            .or_default()
-            .push(BRecord { start, end, fields });
+        if ntabs < 2 {
+            continue; // malformed line
+        }
+        let t1 = tab_pos[0];
+        let t2 = tab_pos[1];
+        let t3 = if ntabs >= 3 { tab_pos[2] } else { line.len() };
+
+        let chrom = std::str::from_utf8(&line[..t1])
+            .map_err(|_| RsomicsError::InvalidInput("B: non-UTF8 chrom".into()))?;
+        let start: u64 = std::str::from_utf8(&line[t1 + 1..t2])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let end: u64 = std::str::from_utf8(&line[t2 + 1..t3])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let (buf, records, max_feat_size) = chrom_data.entry(chrom.to_owned()).or_default();
+        let feat_size = end.saturating_sub(start);
+        if feat_size > *max_feat_size {
+            *max_feat_size = feat_size;
+        }
+        let line_start = buf.len() as u32;
+        buf.extend_from_slice(&line);
+
+        // Build field_ends by scanning for tabs in this line.
+        let mut field_ends: Vec<u32> = Vec::with_capacity(6);
+        let mut pos: u32 = line_start;
+        for &b in &line {
+            pos += 1;
+            if b == b'\t' {
+                field_ends.push(pos - 1);
+            }
+        }
+        field_ends.push(pos); // last field
+
+        records.push(BRecord {
+            start,
+            end,
+            line_start,
+            field_ends,
+        });
     }
-    for v in map.values_mut() {
-        v.sort_unstable_by_key(|r| r.start);
+
+    let mut result: HashMap<String, BChrom> = HashMap::with_capacity(chrom_data.len());
+    for (chrom, (buf, mut records, max_feat_size)) in chrom_data {
+        records.sort_unstable_by_key(|r| r.start);
+        result.insert(
+            chrom,
+            BChrom {
+                buf,
+                records,
+                max_feat_size,
+            },
+        );
     }
-    Ok(map)
+    Ok(result)
 }
 
-/// Get the value of a 1-based column from a BRecord's field list.
-/// Returns empty string if column is out of range.
-fn field_value(rec: &BRecord, col: usize) -> &str {
-    if col == 0 || col > rec.fields.len() {
-        ""
-    } else {
-        &rec.fields[col - 1]
-    }
-}
-
-/// Aggregate a slice of string values using the given operation.
-fn aggregate(values: &[&str], op: Op) -> String {
+/// Aggregate a slice of byte-string values using the given operation.
+fn aggregate_bytes(values: &[Vec<u8>], op: Op) -> Vec<u8> {
     if values.is_empty() {
-        return ".".to_owned();
+        return b".".to_vec();
     }
     match op {
-        Op::Count => values.len().to_string(),
+        Op::Count => values.len().to_string().into_bytes(),
         Op::CountDistinct => {
-            let set: HashSet<&str> = values.iter().copied().collect();
-            set.len().to_string()
+            let set: HashSet<&[u8]> = values.iter().map(Vec::as_slice).collect();
+            set.len().to_string().into_bytes()
         }
-        Op::Collapse => values.join(","),
-        Op::Distinct => {
-            let mut seen = HashSet::new();
+        Op::Collapse => {
             let mut out = Vec::new();
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(v);
+            }
+            out
+        }
+        Op::Distinct => {
+            let mut seen: HashSet<&[u8]> = HashSet::new();
+            let mut out = Vec::new();
+            let mut first = true;
             for v in values {
-                if seen.insert(*v) {
-                    out.push(*v);
+                if seen.insert(v.as_slice()) {
+                    if !first {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(v);
+                    first = false;
                 }
             }
-            out.join(",")
+            out
         }
         Op::Mode => {
-            let mut counts: HashMap<&str, usize> = HashMap::new();
+            let mut counts: HashMap<&[u8], usize> = HashMap::new();
             for v in values {
-                *counts.entry(v).or_insert(0) += 1;
+                *counts.entry(v.as_slice()).or_insert(0) += 1;
             }
             let max_count = counts.values().copied().max().unwrap_or(0);
             values
                 .iter()
-                .find(|&&v| counts[v] == max_count)
-                .copied()
-                .unwrap_or(".")
-                .to_owned()
+                .find(|v| counts[v.as_slice()] == max_count)
+                .cloned()
+                .unwrap_or_else(|| b".".to_vec())
         }
         Op::Sum => {
-            let s: f64 = values.iter().filter_map(|v| v.parse::<f64>().ok()).sum();
-            format_f64(s)
+            let s: f64 = values
+                .iter()
+                .filter_map(|v| std::str::from_utf8(v).ok()?.parse::<f64>().ok())
+                .sum();
+            format_f64(s).into_bytes()
         }
         Op::Min => {
             let m = values
                 .iter()
-                .filter_map(|v| v.parse::<f64>().ok())
+                .filter_map(|v| std::str::from_utf8(v).ok()?.parse::<f64>().ok())
                 .reduce(f64::min);
-            m.map(format_f64).unwrap_or(".".to_owned())
+            m.map_or_else(|| b".".to_vec(), |x| format_f64(x).into_bytes())
         }
         Op::Max => {
             let m = values
                 .iter()
-                .filter_map(|v| v.parse::<f64>().ok())
+                .filter_map(|v| std::str::from_utf8(v).ok()?.parse::<f64>().ok())
                 .reduce(f64::max);
-            m.map(format_f64).unwrap_or(".".to_owned())
+            m.map_or_else(|| b".".to_vec(), |x| format_f64(x).into_bytes())
         }
         Op::Mean => {
             let nums: Vec<f64> = values
                 .iter()
-                .filter_map(|v| v.parse::<f64>().ok())
+                .filter_map(|v| std::str::from_utf8(v).ok()?.parse::<f64>().ok())
                 .collect();
             if nums.is_empty() {
-                ".".to_owned()
+                b".".to_vec()
             } else {
-                format_f64(nums.iter().sum::<f64>() / nums.len() as f64)
+                #[allow(clippy::cast_precision_loss)]
+                let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+                format_f64(mean).into_bytes()
             }
         }
         Op::Median => {
             let mut nums: Vec<f64> = values
                 .iter()
-                .filter_map(|v| v.parse::<f64>().ok())
+                .filter_map(|v| std::str::from_utf8(v).ok()?.parse::<f64>().ok())
                 .collect();
             if nums.is_empty() {
-                return ".".to_owned();
+                return b".".to_vec();
             }
             nums.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let mid = nums.len() / 2;
@@ -208,23 +312,23 @@ fn aggregate(values: &[&str], op: Op) -> String {
             } else {
                 nums[mid]
             };
-            format_f64(median)
+            format_f64(median).into_bytes()
         }
         Op::AbsMin => {
             let m = values
                 .iter()
-                .filter_map(|v| v.parse::<f64>().ok())
-                .map(|x| x.abs())
+                .filter_map(|v| std::str::from_utf8(v).ok()?.parse::<f64>().ok())
+                .map(f64::abs)
                 .reduce(f64::min);
-            m.map(format_f64).unwrap_or(".".to_owned())
+            m.map_or_else(|| b".".to_vec(), |x| format_f64(x).into_bytes())
         }
         Op::AbsMax => {
             let m = values
                 .iter()
-                .filter_map(|v| v.parse::<f64>().ok())
-                .map(|x| x.abs())
+                .filter_map(|v| std::str::from_utf8(v).ok()?.parse::<f64>().ok())
+                .map(f64::abs)
                 .reduce(f64::max);
-            m.map(format_f64).unwrap_or(".".to_owned())
+            m.map_or_else(|| b".".to_vec(), |x| format_f64(x).into_bytes())
         }
     }
 }
@@ -234,7 +338,6 @@ fn format_f64(x: f64) -> String {
     if x.fract() == 0.0 && x.abs() < 1e15 {
         format!("{}", x as i64)
     } else {
-        // Trim trailing zeros after decimal point.
         let s = format!("{x:.6}");
         let s = s.trim_end_matches('0');
         let s = s.trim_end_matches('.');
@@ -244,73 +347,98 @@ fn format_f64(x: f64) -> String {
 
 fn map_reader<R: io::Read>(
     reader: BufReader<R>,
-    b_map: &HashMap<String, Vec<BRecord>>,
+    b_map: &HashMap<String, BChrom>,
     col_ops: &[ColOp],
     null: &str,
     output: &mut dyn Write,
 ) -> Result<()> {
-    let mut out = BufWriter::new(output);
-    let mut hit_values: Vec<Vec<&str>> = vec![Vec::new(); col_ops.len()];
+    let mut out = BufWriter::with_capacity(256 * 1024, output);
+    // Reusable per-ColOp buffers of owned byte vecs (cleared between A records).
+    let mut hit_values: Vec<Vec<Vec<u8>>> = vec![Vec::new(); col_ops.len()];
 
-    for (lineno_0, line) in reader.lines().enumerate() {
-        let line = line.map_err(RsomicsError::Io)?;
+    for (lineno_0, line_result) in reader.split(b'\n').enumerate() {
+        let line = line_result.map_err(RsomicsError::Io)?;
         if is_skippable(&line) {
             continue;
         }
         let lineno = lineno_0 + 1;
-        let mut fields = line.splitn(4, '\t');
-        let chrom = fields
-            .next()
-            .ok_or_else(|| RsomicsError::InvalidInput(format!("line {lineno}: missing chrom")))?
-            .to_owned();
-        let start: u64 = fields
-            .next()
-            .ok_or_else(|| RsomicsError::InvalidInput(format!("line {lineno}: missing start")))?
-            .parse()
-            .map_err(|_| RsomicsError::InvalidInput(format!("line {lineno}: bad start")))?;
-        let end: u64 = fields
-            .next()
-            .ok_or_else(|| RsomicsError::InvalidInput(format!("line {lineno}: missing end")))?
-            .parse()
-            .map_err(|_| RsomicsError::InvalidInput(format!("line {lineno}: bad end")))?;
 
-        // Clear hit value buffers.
-        for vbuf in hit_values.iter_mut() {
+        // Parse A record chrom, start, end.
+        let mut tab_pos = [0usize; 3];
+        let mut ntabs = 0usize;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b'\t' {
+                if ntabs < 3 {
+                    tab_pos[ntabs] = i;
+                }
+                ntabs += 1;
+            }
+        }
+        if ntabs < 2 {
+            return Err(RsomicsError::InvalidInput(format!(
+                "A line {lineno}: fewer than 3 fields"
+            )));
+        }
+        let t1 = tab_pos[0];
+        let t2 = tab_pos[1];
+        let t3 = if ntabs >= 3 { tab_pos[2] } else { line.len() };
+
+        let chrom = std::str::from_utf8(&line[..t1])
+            .map_err(|_| RsomicsError::InvalidInput(format!("A line {lineno}: non-UTF8 chrom")))?;
+        let a_start: u64 = std::str::from_utf8(&line[t1 + 1..t2])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let a_end: u64 = std::str::from_utf8(&line[t2 + 1..t3])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // Clear reusable hit buffers.
+        for vbuf in &mut hit_values {
             vbuf.clear();
         }
 
-        if let Some(b_vec) = b_map.get(&chrom) {
-            // Binary search for upper bound: all B with start < end.
-            let limit = b_vec.partition_point(|r| r.start < end);
-            for b in &b_vec[..limit] {
-                if b.end <= start {
+        if let Some(bchrom) = b_map.get(chrom) {
+            let records = &bchrom.records;
+            // Upper bound: B records with start >= a_end cannot overlap.
+            let upper = records.partition_point(|r| r.start < a_end);
+            // Lower bound: any B record where start + max_feat_size <= a_start cannot
+            // have end > a_start, so it cannot overlap. O(log N + K) per query.
+            let lower = if bchrom.max_feat_size >= a_start {
+                0
+            } else {
+                records.partition_point(|r| r.start + bchrom.max_feat_size <= a_start)
+            };
+            for b_rec in &records[lower..upper] {
+                if b_rec.end <= a_start {
                     continue;
                 }
-                // B overlaps [start, end).
                 for (i, co) in col_ops.iter().enumerate() {
-                    // Count op doesn't need the value, but we still count hits.
                     if co.op == Op::Count {
-                        hit_values[i].push("");
+                        hit_values[i].push(Vec::new());
                     } else {
-                        hit_values[i].push(field_value(b, co.col));
+                        let bytes = bchrom.field_bytes(b_rec, co.col);
+                        hit_values[i].push(bytes.to_vec());
                     }
                 }
             }
         }
 
-        // Write A line (all columns) + aggregated columns.
-        out.write_all(line.as_bytes()).map_err(RsomicsError::Io)?;
+        // Write original A line + aggregated result columns.
+        out.write_all(&line).map_err(RsomicsError::Io)?;
         for (i, co) in col_ops.iter().enumerate() {
-            let result = if hit_values[i].is_empty() {
+            out.write_all(b"\t").map_err(RsomicsError::Io)?;
+            if hit_values[i].is_empty() {
                 if co.op == Op::Count {
-                    "0".to_owned()
+                    out.write_all(b"0").map_err(RsomicsError::Io)?;
                 } else {
-                    null.to_owned()
+                    out.write_all(null.as_bytes()).map_err(RsomicsError::Io)?;
                 }
             } else {
-                aggregate(&hit_values[i], co.op)
-            };
-            write!(out, "\t{result}").map_err(RsomicsError::Io)?;
+                let result = aggregate_bytes(&hit_values[i], co.op);
+                out.write_all(&result).map_err(RsomicsError::Io)?;
+            }
         }
         out.write_all(b"\n").map_err(RsomicsError::Io)?;
     }
@@ -332,7 +460,13 @@ pub fn map(
     let b_map = load_b(b_path)?;
     let a_file = File::open(a_path)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", a_path.display())))?;
-    map_reader(BufReader::new(a_file), &b_map, col_ops, null, output)
+    map_reader(
+        BufReader::with_capacity(256 * 1024, a_file),
+        &b_map,
+        col_ops,
+        null,
+        output,
+    )
 }
 
 /// Same as [`map`] but reads A from stdin.
@@ -343,5 +477,11 @@ pub fn map_stdin(
     output: &mut dyn Write,
 ) -> Result<()> {
     let b_map = load_b(b_path)?;
-    map_reader(BufReader::new(io::stdin()), &b_map, col_ops, null, output)
+    map_reader(
+        BufReader::with_capacity(256 * 1024, io::stdin()),
+        &b_map,
+        col_ops,
+        null,
+        output,
+    )
 }
