@@ -11,7 +11,16 @@ fn bench_bed_map(c: &mut Criterion) {
     c.bench_function("rsomics-bed-map golden", |b_| {
         b_.iter(|| {
             let out = Command::new(black_box(bin))
-                .args(["-a", a.to_str().unwrap(), "-b", b.to_str().unwrap(), "-c", "5", "-o", "sum"])
+                .args([
+                    "-a",
+                    a.to_str().unwrap(),
+                    "-b",
+                    b.to_str().unwrap(),
+                    "-c",
+                    "5",
+                    "-o",
+                    "sum",
+                ])
                 .output()
                 .unwrap();
             assert!(out.status.success());
