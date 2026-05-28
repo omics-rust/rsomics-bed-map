@@ -62,7 +62,7 @@ fn count_op() {
     let lines: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
     let counts: Vec<&str> = lines
         .iter()
-        .map(|l| l.split('\t').last().unwrap_or("."))
+        .map(|l| l.split('\t').next_back().unwrap_or("."))
         .collect();
     assert_eq!(counts, vec!["2", "2", "2"], "counts: {result}");
 }
