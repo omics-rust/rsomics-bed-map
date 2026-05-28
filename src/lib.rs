@@ -205,7 +205,7 @@ fn load_b(path: &Path) -> Result<HashMap<String, BChrom>> {
 fn fast_parse_u64(s: &[u8]) -> u64 {
     let mut n = 0u64;
     for &b in s {
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             break;
         }
         n = n * 10 + u64::from(b - b'0');
