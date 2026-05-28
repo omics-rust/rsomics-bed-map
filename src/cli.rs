@@ -50,9 +50,9 @@ impl Tool for Cli {
             .columns
             .split(',')
             .map(|s| {
-                s.trim().parse::<usize>().map_err(|_| {
-                    RsomicsError::InvalidInput(format!("invalid column index: {s:?}"))
-                })
+                s.trim()
+                    .parse::<usize>()
+                    .map_err(|_| RsomicsError::InvalidInput(format!("invalid column index: {s:?}")))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -60,9 +60,8 @@ impl Tool for Cli {
             .operations
             .split(',')
             .map(|s| {
-                Op::from_str(s.trim()).ok_or_else(|| {
-                    RsomicsError::InvalidInput(format!("unknown operation: {s:?}"))
-                })
+                Op::from_str(s.trim())
+                    .ok_or_else(|| RsomicsError::InvalidInput(format!("unknown operation: {s:?}")))
             })
             .collect::<Result<Vec<_>>>()?;
 

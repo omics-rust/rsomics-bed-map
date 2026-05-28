@@ -109,7 +109,9 @@ fn load_b(path: &Path) -> Result<HashMap<String, Vec<BRecord>>> {
         let chrom = fields[0].clone();
         let start: u64 = fields[1].parse().unwrap_or(0);
         let end: u64 = fields[2].parse().unwrap_or(0);
-        map.entry(chrom).or_default().push(BRecord { start, end, fields });
+        map.entry(chrom)
+            .or_default()
+            .push(BRecord { start, end, fields });
     }
     for v in map.values_mut() {
         v.sort_unstable_by_key(|r| r.start);
@@ -181,7 +183,10 @@ fn aggregate(values: &[&str], op: Op) -> String {
             m.map(format_f64).unwrap_or(".".to_owned())
         }
         Op::Mean => {
-            let nums: Vec<f64> = values.iter().filter_map(|v| v.parse::<f64>().ok()).collect();
+            let nums: Vec<f64> = values
+                .iter()
+                .filter_map(|v| v.parse::<f64>().ok())
+                .collect();
             if nums.is_empty() {
                 ".".to_owned()
             } else {
@@ -189,7 +194,10 @@ fn aggregate(values: &[&str], op: Op) -> String {
             }
         }
         Op::Median => {
-            let mut nums: Vec<f64> = values.iter().filter_map(|v| v.parse::<f64>().ok()).collect();
+            let mut nums: Vec<f64> = values
+                .iter()
+                .filter_map(|v| v.parse::<f64>().ok())
+                .collect();
             if nums.is_empty() {
                 return ".".to_owned();
             }
