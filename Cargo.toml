@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-bed-map"
-version = "0.1.0"
+version = "0.1.1"
 description = "Aggregate column values from B intervals overlapping each A interval — bedtools map equivalent"
 edition = "2024"
 rust-version = "1.91"
