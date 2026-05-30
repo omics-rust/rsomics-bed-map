@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-/// Aggregate operation applied to overlapping B column values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Sum,
@@ -37,7 +36,6 @@ impl Op {
     }
 }
 
-/// One output column: which B field to read and how to aggregate it.
 #[derive(Debug, Clone)]
 pub struct ColOp {
     /// 1-based column index into the B record.
@@ -45,7 +43,6 @@ pub struct ColOp {
     pub op: Op,
 }
 
-/// Aggregate byte-string values for the given operation. Returns `.` when empty.
 pub(crate) fn aggregate_bytes(values: &[&[u8]], op: Op) -> Vec<u8> {
     if values.is_empty() {
         return b".".to_vec();

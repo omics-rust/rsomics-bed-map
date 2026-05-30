@@ -98,7 +98,6 @@ pub(crate) fn map_raw(
     Ok(())
 }
 
-/// Run bedtools-map-equivalent on A file vs B file.
 pub fn map(
     a_path: &Path,
     b_path: &Path,
@@ -115,7 +114,6 @@ pub fn map(
     map_raw(&a_raw, &b_map, col_ops, null, output)
 }
 
-/// Like [`map`] but reads A from stdin.
 pub fn map_stdin(
     b_path: &Path,
     col_ops: &[ColOp],

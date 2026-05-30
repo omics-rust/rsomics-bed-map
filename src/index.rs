@@ -5,7 +5,6 @@ use std::path::Path;
 
 use rsomics_common::{Result, RsomicsError};
 
-/// One B interval: coordinates + byte offsets of fields into `BChrom::buf`.
 pub(crate) struct BRecord {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -14,7 +13,6 @@ pub(crate) struct BRecord {
     pub(crate) line_start: u32,
 }
 
-/// Per-chromosome B data: raw line buffer + sorted records + max interval width.
 pub(crate) struct BChrom {
     pub(crate) buf: Vec<u8>,
     pub(crate) records: Vec<BRecord>,
@@ -47,7 +45,6 @@ pub(crate) fn is_skippable(line: &[u8]) -> bool {
         || line.starts_with(b"browser")
 }
 
-/// Finds the first three tab positions; returns total tab count.
 #[inline]
 pub(crate) fn parse_tab3(line: &[u8], tab_pos: &mut [usize; 3]) -> usize {
     let mut ntabs = 0;
@@ -62,7 +59,6 @@ pub(crate) fn parse_tab3(line: &[u8], tab_pos: &mut [usize; 3]) -> usize {
     ntabs
 }
 
-/// Stops at first non-digit byte.
 #[inline]
 pub(crate) fn fast_parse_u64(s: &[u8]) -> u64 {
     let mut n = 0u64;
@@ -75,8 +71,7 @@ pub(crate) fn fast_parse_u64(s: &[u8]) -> u64 {
     n
 }
 
-/// Load B BED into memory. Field bytes are accessed via offsets into a single
-/// per-chromosome buffer — zero per-field String allocations.
+/// Field bytes accessed via offsets into a per-chrom buffer — no per-field allocation.
 pub(crate) fn load_b(path: &Path) -> Result<HashMap<String, BChrom>> {
     let mut raw = Vec::new();
     File::open(path)
